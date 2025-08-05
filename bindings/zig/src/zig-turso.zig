@@ -6,7 +6,7 @@ const c = @cImport({
     @cInclude("limbo_zig.h");
 });
 
-pub const ConnError = error{
+pub const DbError = error{
     ConnectionFailed,
 };
 
@@ -15,6 +15,10 @@ pub const StatementError = error{
     ExecuteFailed,
     NotImplemented,
     ZeroArguments,
+};
+
+pub const RowError = error{
+    NoMoreRows,
 };
 
 pub const ResultValue = enum(i64) {
@@ -92,9 +96,9 @@ const Statement = struct {
     allocator: Allocator,
 
     fn handle_args(allocator: Allocator, args: []LimboValue) ![]c.LimboValue {
-        if (args.len == 0) {
-            return StatementError.ZeroArguments;
-        }
+        // if (args.len == 0) {
+        //     return StatementError.ZeroArguments;
+        // }
 
         var c_args = try allocator.alloc(c.LimboValue, args.len);
 
@@ -106,26 +110,24 @@ const Statement = struct {
         return c_args;
     }
 
-    fn execute(self: *Statement, args: []LimboValue) !Result {
+    fn execute(self: *Statement, args: ?[]LimboValue) !void {
         var rows_changed: i64 = undefined;
 
         var result_code: i64 = 0;
-        if (args.len == 0) {
-            result_code = c.stmt_execute(self.handle, null, args.len, &rows_changed);
-        } else {
-            const c_args = try Statement.handle_args(self.allocator, args);
+
+        if (args) |a| {
+            const c_args = try Statement.handle_args(self.allocator, a);
             defer self.allocator.free(c_args);
-            result_code = c.stmt_execute(self.handle, c_args.ptr, args.len, &rows_changed);
+            result_code = c.stmt_execute(self.handle, c_args.ptr, a.len, &rows_changed);
+        } else {
+            result_code = c.stmt_execute(self.handle, null, 0, &rows_changed);
         }
 
         if (result_code != 10) {
             std.log.err("Statement execution failed with code: {any}\n", .{result_code});
             return StatementError.ExecuteFailed;
         } else if (result_code == 10) {
-            return Result{
-                .value = ResultValue.Done,
-                .changed = rows_changed,
-            };
+            return;
         } else {
             return StatementError.ExecuteFailed;
         }
@@ -171,45 +173,44 @@ const Statement = struct {
     }
 };
 
-pub const Conn = struct {
+pub const Db = struct {
+    const Self = @This();
+
     handle: ?*anyopaque,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, path: []const u8) ConnError!Conn {
+    pub const Mode = union(enum) {
+        File: []const u8,
+        Memory,
+    };
+
+    // TODO: not supported on rust/c side yet. Defaults to create in Turso.
+    // pub const OpenFlags = struct {
+    //     write: bool = false,
+    //     create: bool = false,
+    // };
+
+    pub fn init(allocator: Allocator, mode: Mode) DbError!Db {
+        const path: []const u8 = switch (mode) {
+            .File => mode.File,
+            .Memory => ":memory:",
+        };
         const db_handle = c.db_open(path.ptr);
         if (db_handle == null) {
-            return ConnError.ConnectionFailed;
+            return DbError.ConnectionFailed;
         }
-        return Conn{ .handle = db_handle, .allocator = allocator };
+        return Self{ .handle = db_handle, .allocator = allocator };
     }
 
-    pub fn close(self: *Conn) void {
+    pub fn close(self: *Db) void {
         if (self.handle) |h| {
             c.db_close(h);
         }
     }
 
-    pub fn cursor(self: *Conn) !Cursor {
-        if (self.handle == null) {
-            return ConnError.ConnectionFailed;
-        }
-        return Cursor{
-            .array_size = 1,
-            .statement_str = null,
-            .conn = self,
-        };
-    }
-};
-
-pub const Cursor = struct {
-    array_size: i64,
-    statement_str: ?[]const u8,
-    conn: *Conn,
-    rows: ?*Rows = null,
-
-    pub fn execute(self: *Cursor, query: []const u8, args: []LimboValue) !Result {
-        const query_lower: []const u8 = try std.ascii.allocLowerString(self.conn.allocator, query);
-        defer self.conn.allocator.free(query_lower);
+    pub fn exec(self: *Db, query: []const u8, args: ?[]LimboValue) !void {
+        const query_lower: []const u8 = try std.ascii.allocLowerString(self.allocator, query);
+        defer self.allocator.free(query_lower);
 
         var stmt: Statement = try self.prepare(query);
         defer stmt.close();
@@ -220,83 +221,137 @@ pub const Cursor = struct {
             std.mem.startsWith(u8, query_lower, "delete") or
             std.mem.startsWith(u8, query_lower, "drop"))
         {
-            const res: Result = try stmt.execute(args);
-            return res;
-        } else if (std.mem.startsWith(u8, query_lower, "select") or
-            std.mem.startsWith(u8, query_lower, "alter"))
+            if (args) |a| {
+                try stmt.execute(a);
+                return;
+            } else {
+                try stmt.execute(null);
+                return;
+            }
+        } else if (std.mem.startsWith(u8, query_lower, "select"))
         {
-            const res: RowResult = try stmt.query(args);
-            self.rows = res.rows;
-            return Result{
-                .value = res.value,
-                .changed = res.changed,
-            };
+            // TODO:
+            // _ = try stmt.query(args);
+
+            // self.rows = res.rows;
+            // return Result{
+            //     .value = res.value,
+            //     .changed = res.changed,
+            // };
+            // return;
+            return
         } else {
             // Other statements are not implemented yet.
             return StatementError.NotImplemented;
         }
     }
 
-    fn prepare(self: *Cursor, query: []const u8) !Statement {
-        self.statement_str = query;
-        const stmt_handle = c.db_prepare(self.conn.handle, query.ptr);
+    pub fn prepare(self: *Db, query: []const u8) !Statement {
+        const stmt_handle = c.db_prepare(self.handle, query.ptr);
         if (stmt_handle == null) {
             return StatementError.PrepareFailed;
         }
         return Statement{
             .handle = stmt_handle,
-            .allocator = self.conn.allocator,
+            .allocator = self.allocator,
         };
     }
 
-    pub fn fetch_one(self: *Cursor) !?Row {
-        if (self.rows == null) {
-            return null; // No rows to fetch
-        }
-
-        const row: ?Row = try self.rows.?.next();
-        if (row == null) {
-            return null; // No more rows
-        }
-
-        return row.?;
-    }
-
-    pub fn fetch_many(self: *Cursor, limit: ?usize) !?[]Row {
-        if (self.rows == null) {
-            return null; // No rows to fetch
-        }
-
-        var rows = std.ArrayList(Row).init(self.conn.allocator);
-        // if (limit != null) {
-        //     try rows.initCapacity(self.conn.allocator, limit.?);
-        // } else {
-        //     try rows.init(self.conn.allocator);
-        // }
-
-        var row: ?Row = try self.rows.?.next();
-        var i: usize = 0;
-        while (row != null) {
-            if (limit != null) {
-                if (i < limit.?) {
-                    try rows.append(row.?);
-                } else {
-                    break;
-                }
-            } else {
-                try rows.append(row.?);
-            }
-            row = try self.rows.?.next();
-            i += 1;
-        }
-
-        return try rows.toOwnedSlice();
-    }
+    fn 
 };
-
-pub const RowError = error{
-    NoMore,
-};
+//
+// pub const Cursor = struct {
+//     array_size: i64,
+//     statement_str: ?[]const u8,
+//     conn: *Db,
+//     rows: ?*Rows = null,
+//
+//     pub fn execute(self: *Cursor, query: []const u8, args: []LimboValue) !Result {
+//         const query_lower: []const u8 = try std.ascii.allocLowerString(self.conn.allocator, query);
+//         defer self.conn.allocator.free(query_lower);
+//
+//         var stmt: Statement = try self.prepare(query);
+//         defer stmt.close();
+//
+//         if (std.mem.startsWith(u8, query_lower, "insert") or
+//             std.mem.startsWith(u8, query_lower, "update") or
+//             std.mem.startsWith(u8, query_lower, "create") or
+//             std.mem.startsWith(u8, query_lower, "delete") or
+//             std.mem.startsWith(u8, query_lower, "drop"))
+//         {
+//             const res: Result = try stmt.execute(args);
+//             return res;
+//         } else if (std.mem.startsWith(u8, query_lower, "select") or
+//             std.mem.startsWith(u8, query_lower, "alter"))
+//         {
+//             const res: RowResult = try stmt.query(args);
+//             self.rows = res.rows;
+//             return Result{
+//                 .value = res.value,
+//                 .changed = res.changed,
+//             };
+//         } else {
+//             // Other statements are not implemented yet.
+//             return StatementError.NotImplemented;
+//         }
+//     }
+//
+//     fn prepare(self: *Cursor, query: []const u8) !Statement {
+//         self.statement_str = query;
+//         const stmt_handle = c.db_prepare(self.conn.handle, query.ptr);
+//         if (stmt_handle == null) {
+//             return StatementError.PrepareFailed;
+//         }
+//         return Statement{
+//             .handle = stmt_handle,
+//             .allocator = self.conn.allocator,
+//         };
+//     }
+//
+//     pub fn fetch_one(self: *Cursor) !?Row {
+//         if (self.rows == null) {
+//             return null; // No rows to fetch
+//         }
+//
+//         const row: ?Row = try self.rows.?.next();
+//         if (row == null) {
+//             return null; // No more rows
+//         }
+//
+//         return row.?;
+//     }
+//
+//     pub fn fetch_many(self: *Cursor, limit: ?usize) !?[]Row {
+//         if (self.rows == null) {
+//             return null; // No rows to fetch
+//         }
+//
+//         var rows = std.ArrayList(Row).init(self.conn.allocator);
+//         // if (limit != null) {
+//         //     try rows.initCapacity(self.conn.allocator, limit.?);
+//         // } else {
+//         //     try rows.init(self.conn.allocator);
+//         // }
+//
+//         var row: ?Row = try self.rows.?.next();
+//         var i: usize = 0;
+//         while (row != null) {
+//             if (limit != null) {
+//                 if (i < limit.?) {
+//                     try rows.append(row.?);
+//                 } else {
+//                     break;
+//                 }
+//             } else {
+//                 try rows.append(row.?);
+//             }
+//             row = try self.rows.?.next();
+//             i += 1;
+//         }
+//
+//         return try rows.toOwnedSlice();
+//     }
+// };
 
 pub const Rows = struct {
     handle: ?*anyopaque,
@@ -310,7 +365,7 @@ pub const Rows = struct {
         const result = c.rows_next(self.handle);
         if (result != 1) {
             print("Error fetching more rows: {any}\n", .{result});
-            return RowError.NoMore; // No more rows
+            return RowError.NoMoreRows; // No more rows
         }
 
         const cols = c.rows_get_columns(self.handle);

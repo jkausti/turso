@@ -9,6 +9,7 @@ members = [
     "bindings/javascript",
     "bindings/python",
     "bindings/rust",
+    "bindings/zig",
     "cli",
     "core",
     "extensions/completion",

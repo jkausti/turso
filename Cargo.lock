@@ -1905,6 +1905,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo-zig"
+version = "0.1.3"
+dependencies = [
+ "turso_core",
+]
+
+[[package]]
 name = "limbo_completion"
 version = "0.1.3"
 dependencies = [
