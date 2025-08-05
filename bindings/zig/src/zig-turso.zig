@@ -15,6 +15,7 @@ pub const StatementError = error{
     ExecuteFailed,
     NotImplemented,
     ZeroArguments,
+    InvalidStatement,
 };
 
 pub const RowError = error{
@@ -51,7 +52,7 @@ pub const Result = struct {
 pub const RowResult = struct {
     value: ResultValue,
     changed: i64,
-    rows: ?*Rows = null,
+    rows: ?*Rows,
 
     // pub fn format(self: Result, fmt: anytype) !void {
     //     try fmt.print("Result(value: {any}, changed: {any})", .{ self.value, self.changed });
@@ -228,18 +229,9 @@ pub const Db = struct {
                 try stmt.execute(null);
                 return;
             }
-        } else if (std.mem.startsWith(u8, query_lower, "select"))
-        {
-            // TODO:
-            // _ = try stmt.query(args);
-
-            // self.rows = res.rows;
-            // return Result{
-            //     .value = res.value,
-            //     .changed = res.changed,
-            // };
-            // return;
-            return
+        } else if (std.mem.startsWith(u8, query_lower, "select")) {
+            print("When executing a select statement, use the prepare method instead to get a prepared statement.\n", .{});
+            return StatementError.InvalidStatement;
         } else {
             // Other statements are not implemented yet.
             return StatementError.NotImplemented;
@@ -257,7 +249,13 @@ pub const Db = struct {
         };
     }
 
-    fn 
+    pub fn oneAlloc(self: *Self, allocator: Allocator, comptime T: type, query: []const u8, args: ?[]LimboValue, values: anytype) !?T {
+        var stmt: Statement = try self.prepare(query);
+        defer stmt.close();
+
+        //
+
+    }
 };
 //
 // pub const Cursor = struct {
