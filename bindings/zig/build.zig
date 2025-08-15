@@ -18,10 +18,10 @@ pub fn build(b: *std.Build) void {
         .root_module = zig_turso,
     });
 
-    // lib_zig_turso.linkLibC();
-    // lib_zig_turso.addIncludePath(b.path("header"));
-    // lib_zig_turso.addLibraryPath(b.path("../../target/debug"));
-    // lib_zig_turso.linkSystemLibrary("_limbo_zig");
+    lib_zig_turso.linkLibC();
+    lib_zig_turso.addIncludePath(b.path("header"));
+    lib_zig_turso.addLibraryPath(b.path("../../target/debug"));
+    lib_zig_turso.linkSystemLibrary("_limbo_zig");
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -55,6 +55,11 @@ pub fn build(b: *std.Build) void {
         ) orelse &.{},
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
     });
+
+    test_exe.linkLibC();
+    test_exe.addIncludePath(b.path("header"));
+    test_exe.addLibraryPath(b.path("../../target/debug"));
+    test_exe.linkSystemLibrary("_limbo_zig");
 
     // test_exe.root_module.addImport("zig-turso", zig_turso);
     // test_exe.linkLibrary(lib_zig_turso);

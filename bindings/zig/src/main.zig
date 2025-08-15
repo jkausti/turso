@@ -48,16 +48,19 @@ pub fn main() !void {
         print("Error executing query. {any}\n", .{err});
         return err;
     };
-    
-    pub const Person = struct {
+
+    const Person = struct {
         id: u64,
         name: []const u8,
         age: u32,
     };
 
-
-    const query = "SELECT id, name, age FROM test;";
-    try db.oneAlloc(allocator, Person, &query, null, null);
-    
-    
+    const query = "SELECT id, name, age FROM test";
+    const person = try db.oneAlloc(allocator, Person, query, null, null);
+    if (person == null) {
+        print("person is null", .{});
+    } else {
+        print("Person id: {}\n", .{person.?.id});
+        print("Person id: {s}\n", .{person.?.name});
+    }
 }
