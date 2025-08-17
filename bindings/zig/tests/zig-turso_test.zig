@@ -167,7 +167,7 @@ test "oneAlloc basic" {
     };
 
     const Person = struct {
-        id: i32,
+        id: i64,
         name: []const u8,
         age: i64,
     };
@@ -177,10 +177,108 @@ test "oneAlloc basic" {
     const person = try db.oneAlloc(allocator, query, Person, null, null);
     if (person == null) {
         print("No person found.\n", .{});
+        return;
     }
+    defer allocator.destroy(person.?);
+
     print("Person: {any}\n", .{person.?});
 
     try tst.expect(person.?.id == 1);
     try tst.expectEqualStrings(person.?.name, "urmom");
     try tst.expect(person.?.age == 34);
+}
+
+test "manyAlloc basic" {
+    const allocator = tst.allocator;
+    const db_path = "tests/artifacts/test.db";
+
+    var db = try Db.init(.{ .File = db_path });
+    defer db.close();
+
+    try tst.expect(db.handle != null);
+
+    var params_first: [2]LimboValue = undefined;
+    var params_second: [2]LimboValue = undefined;
+
+    params_first[0] = LimboValue{
+        .value_type = ValueType.Text,
+        .value = ValueUnion{ .text_ptr = "urmom".ptr },
+    };
+    params_first[1] = LimboValue{
+        .value_type = ValueType.Integer,
+        .value = ValueUnion{ .int_val = 33 },
+    };
+
+    params_second[0] = LimboValue{
+        .value_type = ValueType.Text,
+        .value = ValueUnion{ .text_ptr = "urdad".ptr },
+    };
+    params_second[1] = LimboValue{
+        .value_type = ValueType.Integer,
+        .value = ValueUnion{ .int_val = 36 },
+    };
+
+    db.exec(
+        allocator,
+        "DROP TABLE IF EXISTS test;",
+        null,
+    ) catch |err| {
+        print("Error executing query. {any}\n", .{err});
+        return err;
+    };
+
+    db.exec(
+        allocator,
+        "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER);",
+        null,
+    ) catch |err| {
+        print("Error executing query. {any}\n", .{err});
+        return err;
+    };
+
+    db.exec(
+        allocator,
+        "INSERT INTO test (name, age) VALUES (?, ?);",
+        &params_first,
+    ) catch |err| {
+        print("Error executing query. {any}\n", .{err});
+        return err;
+    };
+    db.exec(
+        allocator,
+        "INSERT INTO test (name, age) VALUES (?, ?);",
+        &params_second,
+    ) catch |err| {
+        print("Error executing query. {any}\n", .{err});
+        return err;
+    };
+
+    const Person = struct {
+        id: i64,
+        name: []const u8,
+        age: i64,
+    };
+
+    const query = "SELECT id, name, age FROM test";
+
+    const result = try db.manyAlloc(allocator, Person, query, null, null, null);
+
+    if (result == null) {
+        print("No results returned.\n", .{});
+        return;
+    }
+    defer {
+        for (result.?) |person| {
+            allocator.destroy(person);
+        }
+        allocator.free(result.?);
+    }
+
+    try tst.expect(result != null);
+    try tst.expect(result.?.len == 2);
+
+    try tst.expect(result.?[0].*.id == 1);
+    try tst.expect(result.?[1].*.id == 2);
+    try tst.expectEqualStrings(result.?[0].*.name, "urmom");
+    try tst.expectEqualStrings(result.?[1].*.name, "urdad");
 }

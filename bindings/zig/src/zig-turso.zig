@@ -22,6 +22,7 @@ pub const StatementError = error{
 pub const RowError = error{
     NoMoreRows,
     NullPointer,
+    NoColumns,
 };
 
 pub const ResultValue = enum(i64) {
@@ -187,7 +188,15 @@ pub const Db = struct {
         };
     }
 
-    pub fn oneAlloc(self: *Self, allocator: Allocator, comptime query: []const u8, comptime T: type, args: ?[]LimboValue, values: anytype) !?T {
+    pub fn manyAlloc(
+        self: *Self,
+        allocator: Allocator,
+        comptime T: type,
+        comptime query: []const u8,
+        limit: ?usize,
+        args: ?[]LimboValue,
+        values: anytype,
+    ) !?[]*T {
         var query_lower: [query.len]u8 = undefined;
 
         for (query, 0..) |ch, i| {
@@ -199,34 +208,150 @@ pub const Db = struct {
 
         var rows: Rows = undefined;
         defer rows.close();
-        var row_slice: ?[]LimboValue = undefined;
-        defer allocator.free(row_slice.?);
+        // var row_slice: ?[]LimboValue = undefined;
+        // defer allocator.free(row_slice.?);
+
+        var many_rows = std.ArrayList([]LimboValue).init(allocator);
+        defer {
+            for (many_rows.items) |item| {
+                allocator.free(item);
+            }
+            many_rows.deinit();
+        }
 
         if (std.mem.startsWith(u8, &query_lower, "select")) {
             var stmt: Statement = try self.prepare(allocator, query);
             defer stmt.close();
             rows = try stmt.query(args orelse &.{});
-            row_slice = try rows.one(allocator);
+            if (limit) |l| {
+                var i: usize = 0;
+                while (i < l) : (i += 1) {
+                    var row_array = std.ArrayList(LimboValue).init(allocator);
+                    rows.one(&row_array) catch |err| {
+                        if (err == RowError.NoMoreRows) {
+                            break; // No more rows to fetch
+                        }
+                        return err; // Propagate other errors
+                    };
+                    const row_slice = try row_array.toOwnedSlice();
+                    try many_rows.append(row_slice);
+                }
+            } else {
+                while (true) {
+                    var row_array = std.ArrayList(LimboValue).init(allocator);
+                    rows.one(&row_array) catch |err| {
+                        if (err == RowError.NoMoreRows) {
+                            break; // No more rows to fetch
+                        }
+                        return err; // Propagate other errors
+                    };
+                    const row_slice = try row_array.toOwnedSlice();
+                    try many_rows.append(row_slice);
+                }
+            }
+        }
+
+        // return try many_rows.toOwnedSlice();
+
+        var instances = std.ArrayList(*T).init(allocator);
+        const fields = std.meta.fields(T);
+
+        for (many_rows.items) |row_slice| {
+            const instance: *T = try allocator.create(T);
+            inline for (fields, 0..) |field, i| {
+                const limbo_value = row_slice[i];
+                switch (limbo_value.value_type) {
+                    .Integer => {
+                        if (field.type == i64) {
+                            @field(instance.*, field.name) = limbo_value.value.int_val;
+                        } else {
+                            std.log.err("Field {s} is of type {s}, but LimboValue is Integer (i64).\n", .{ field.name, @typeName(field.type) });
+                            return null;
+                        }
+                    },
+                    .Text => {
+                        if (field.type == []const u8) {
+                            @field(instance.*, field.name) = std.mem.span(limbo_value.value.text_ptr);
+                        } else {
+                            std.log.err("Field {s} is of type {s}, but LimboValue is Text.\n", .{ field.name, @typeName(field.type) });
+                            return null;
+                        }
+                    },
+                    .Blob => {
+                        std.log.err("Database returned blob type. Blobs not supported in Zig bindings.\n", .{});
+                        return null;
+                    },
+                    .Real => {
+                        if (field.type == f64) {
+                            @field(instance.*, field.name) = limbo_value.value.real_val;
+                        } else {
+                            std.log.err("Field {s} is of type {s}, but LimboValue is Real (f64).\n", .{ field.name, @typeName(field.type) });
+                            return null;
+                        }
+                    },
+                    .NullValue => {},
+                }
+            }
+            try instances.append(instance);
+        }
+        return try instances.toOwnedSlice();
+    }
+
+    pub fn oneAlloc(self: *Self, allocator: Allocator, comptime query: []const u8, comptime T: type, args: ?[]LimboValue, values: anytype) !?*T {
+        var query_lower: [query.len]u8 = undefined;
+
+        for (query, 0..) |ch, i| {
+            query_lower[i] = std.ascii.toLower(ch);
+        }
+
+        // TODO: implement usage of `values` parameter
+        _ = values;
+
+        var rows: Rows = undefined;
+        defer rows.close();
+        // var row_slice: ?[]LimboValue = undefined;
+        // defer {
+        //     for (row_slice.?) |item| {
+        //         allocator.destroy(item);
+        //     }
+        //     allocator.free(row_slice.?);
+        // }
+
+        // allocator.free(row_slice.?);
+        var results_array = std.ArrayList(LimboValue).init(allocator);
+
+        if (std.mem.startsWith(u8, &query_lower, "select")) {
+            var stmt: Statement = try self.prepare(allocator, query);
+            defer stmt.close();
+            rows = try stmt.query(args orelse &.{});
+            try rows.one(&results_array);
+        }
+
+        const row_slice = try results_array.toOwnedSlice();
+        defer {
+            allocator.free(row_slice);
         }
 
         // parse slice into T
-        var instance: T = undefined;
+        const instance: *T = try allocator.create(T);
+        errdefer allocator.destroy(instance);
+        // defer allocator.destroy(instance.*);
         const fields = std.meta.fields(T);
 
         inline for (fields, 0..) |field, i| {
-            const limbo_value = row_slice.?[i];
+            const limbo_value = row_slice[i];
             switch (limbo_value.value_type) {
                 .Integer => {
                     if (field.type == i64) {
-                        @field(instance, field.name) = limbo_value.value.int_val;
+                        @field(instance.*, field.name) = limbo_value.value.int_val;
                     } else {
-                        std.log.err("Field {s} is of type {s}, but LimboValue is Integer.\n", .{ field.name, @typeName(field.type) });
+                        std.log.err("Field {s} is of type {s}, but LimboValue is Integer (i64).\n", .{ field.name, @typeName(field.type) });
                         return null;
                     }
                 },
                 .Text => {
                     if (field.type == []const u8) {
-                        @field(instance, field.name) = std.mem.span(limbo_value.value.text_ptr);
+                        @field(instance.*, field.name) = std.mem.span(limbo_value.value.text_ptr);
                     } else {
                         std.log.err("Field {s} is of type {s}, but LimboValue is Text.\n", .{ field.name, @typeName(field.type) });
                         return null;
@@ -238,9 +363,9 @@ pub const Db = struct {
                 },
                 .Real => {
                     if (field.type == f64) {
-                        @field(instance, field.name) = limbo_value.value.real_val;
+                        @field(instance.*, field.name) = limbo_value.value.real_val;
                     } else {
-                        std.log.err("Field {s} is of type {s}, but LimboValue is Real.\n", .{ field.name, @typeName(field.type) });
+                        std.log.err("Field {s} is of type {s}, but LimboValue is Real (f64).\n", .{ field.name, @typeName(field.type) });
                         return null;
                     }
                 },
@@ -323,14 +448,14 @@ const Statement = struct {
 pub const Rows = struct {
     handle: ?*anyopaque,
 
-    pub fn one(self: Rows, allocator: Allocator) !?[]LimboValue {
+    pub fn one(self: Rows, result_array: *std.ArrayList(LimboValue)) !void {
         if (self.handle == null) {
-            return null;
+            return RowError.NullPointer; // Handle is null, no rows to fetch
         }
 
         const has_next = c.rows_next(self.handle);
         if (has_next != 1) {
-            print("Error fetching more rows: {any}\n", .{has_next});
+            std.log.debug("has_next is {d}. No more rows.\n", .{has_next});
             return RowError.NoMoreRows; // No more rows
         }
         std.log.debug("has_next is 1.", .{});
@@ -338,11 +463,10 @@ pub const Rows = struct {
         const cols = c.rows_get_columns(self.handle);
 
         if (cols == 0) {
-            return null; // No columns returned
+            return RowError.NoColumns; // No columns returned
         }
 
-        var row = try std.ArrayList(LimboValue).initCapacity(allocator, @intCast(cols));
-        defer row.deinit();
+        // var row = try std.ArrayList(LimboValue).initCapacity(allocator, @intCast(cols));
 
         for (0..@intCast(cols)) |col_idx| {
             const val_handle = c.rows_get_value(self.handle, col_idx);
@@ -356,61 +480,13 @@ pub const Rows = struct {
             var zig_value: LimboValue = undefined;
 
             LimboValue.from_c(limbo_value, &zig_value);
-            try row.append(zig_value);
+            // const alloced_zig_value = try allocator.create(LimboValue);
+            // alloced_zig_value.* = zig_value;
+            try result_array.append(zig_value);
         }
 
-        // const t_fields = std.meta.fields(T);
-        const row_slice = try row.toOwnedSlice();
-        // defer allocator.free(row_slice);
-
-        // var res: T = undefined;
-        // var res: T = try allocator.create(T);
-        // var res: [cols]LimboValue = undefined;
-
-        // std.log.debug("Looping fields and switching on row_slice\n", .{});
-        // inline for (t_fields, 0..) |field, i| {
-        //     switch (row_slice[i].value) {
-        //         .int_val => |v| {
-        //             if (@TypeOf(v) == field.type) {
-        //                 const v_heap = try allocator.create(@TypeOf(v));
-        //                 v_heap.* = v;
-        //                 @field(res, field.name) = v_heap;
-        //             }
-        //         },
-        //         .real_val => |v| {
-        //             if (@TypeOf(v) == field.type) {
-        //                 const v_heap = try allocator.create(@TypeOf(v));
-        //                 v_heap.* = v;
-        //                 @field(res, field.name) = v_heap;
-        //             }
-        //         },
-        //         .text_ptr => |v| {
-        //             if (@TypeOf(v) == field.type) {
-        //                 const zig_ptr = allocator.dupe(u8, std.mem.span(v));
-        //                 @field(res, field.name) = zig_ptr;
-        //             }
-        //         },
-        //         .blob_ptr => |v| {
-        //             if (@TypeOf(v) == field.type) {
-        //                 const zig_ptr = allocator.dupe(u8, std.mem.span(v));
-        //                 @field(res, field.name) = zig_ptr;
-        //             }
-        //         },
-        //         // else => unreachable,
-        //     }
-        // }
-
-        // for (row_slice) |val| {
-        //     switch (val.value_type) {
-        //         .Integer => res[i] = LimboValue{ .value_type = .Integer, .value = .{ .int_val = limbo_value.value.int_val } },
-        //         .Text => res[i] = LimboValue{ .value_type = .Text, .value = .{ .text_ptr = limbo_value.value.text_ptr } },
-        //         .Blob => res[i] = LimboValue{ .value_type = .Blob, .value = .{ .blob_ptr = limbo_value.value.blob_ptr } },
-        //         .Real => res[i] = LimboValue{ .value_type = .Real, .value = .{ .real_val = limbo_value.value.real_val } },
-        //         .NullValue => res[i] = LimboValue{ .value_type = .NullValue, .value = undefined },
-        //     }
-        // }
-        std.log.debug("Returning result: {any}\n", .{row_slice});
-        return row_slice;
+        // const row_slice = try row.toOwnedSlice();
+        std.log.debug("Finished row result: {any}\n", .{result_array.items});
     }
 
     pub fn next(self: *Rows) !?Row {
